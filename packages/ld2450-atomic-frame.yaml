@@ -1,0 +1,96 @@
+substitutions:
+  ld2450_component_id: ld2450_radar
+  atomic_frame_name: LD2450 Atomic Frame
+  atomic_target_sensors_internal: "true"
+
+ld2450:
+  id: ${ld2450_component_id}
+  on_data:
+    then:
+      - lambda: |-
+          auto value_or_zero = [](float value) -> int {
+            return std::isnan(value) ? 0 : static_cast<int>(std::lround(value));
+          };
+
+          const int x1 = value_or_zero(id(ld2450_atomic_t1_x).state);
+          const int y1 = value_or_zero(id(ld2450_atomic_t1_y).state);
+          const int v1 = value_or_zero(id(ld2450_atomic_t1_speed).state / 10.0f);
+          const int x2 = value_or_zero(id(ld2450_atomic_t2_x).state);
+          const int y2 = value_or_zero(id(ld2450_atomic_t2_y).state);
+          const int v2 = value_or_zero(id(ld2450_atomic_t2_speed).state / 10.0f);
+          const int x3 = value_or_zero(id(ld2450_atomic_t3_x).state);
+          const int y3 = value_or_zero(id(ld2450_atomic_t3_y).state);
+          const int v3 = value_or_zero(id(ld2450_atomic_t3_speed).state / 10.0f);
+
+          if ((x1 == 0 && y1 == 0) &&
+              (x2 == 0 && y2 == 0) &&
+              (x3 == 0 && y3 == 0)) {
+            return;
+          }
+
+          char frame[128];
+          snprintf(frame, sizeof(frame), "%lu|%d,%d,%d|%d,%d,%d|%d,%d,%d",
+                   static_cast<unsigned long>(millis()),
+                   x1, y1, v1,
+                   x2, y2, v2,
+                   x3, y3, v3);
+          id(ld2450_atomic_frame).publish_state(frame);
+
+sensor:
+  - platform: ld2450
+    ld2450_id: ${ld2450_component_id}
+    target_1:
+      x:
+        id: ld2450_atomic_t1_x
+        name: LD2450 Target 1 X
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+      y:
+        id: ld2450_atomic_t1_y
+        name: LD2450 Target 1 Y
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+      speed:
+        id: ld2450_atomic_t1_speed
+        name: LD2450 Target 1 Speed
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+    target_2:
+      x:
+        id: ld2450_atomic_t2_x
+        name: LD2450 Target 2 X
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+      y:
+        id: ld2450_atomic_t2_y
+        name: LD2450 Target 2 Y
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+      speed:
+        id: ld2450_atomic_t2_speed
+        name: LD2450 Target 2 Speed
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+    target_3:
+      x:
+        id: ld2450_atomic_t3_x
+        name: LD2450 Target 3 X
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+      y:
+        id: ld2450_atomic_t3_y
+        name: LD2450 Target 3 Y
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+      speed:
+        id: ld2450_atomic_t3_speed
+        name: LD2450 Target 3 Speed
+        internal: ${atomic_target_sensors_internal}
+        filters: []
+
+text_sensor:
+  - platform: template
+    id: ld2450_atomic_frame
+    name: ${atomic_frame_name}
+    entity_category: diagnostic
+    update_interval: never

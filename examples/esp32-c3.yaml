@@ -1,0 +1,55 @@
+substitutions:
+  device_name: ld2450-atomic-frame
+  friendly_name: LD2450 Atomic Frame
+  ld2450_component_id: ld2450_radar
+  atomic_frame_name: LD2450 Atomic Frame
+  atomic_target_sensors_internal: "true"
+
+packages:
+  atomic_frame: !include ../packages/ld2450-atomic-frame.yaml
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.6.1
+
+esp32:
+  board: lolin_c3_mini
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+
+uart:
+  id: uart_ld2450
+  tx_pin: GPIO5
+  rx_pin: GPIO4
+  baud_rate: 256000
+  parity: NONE
+  stop_bits: 1
+
+ld2450:
+  id: ${ld2450_component_id}
+  uart_id: uart_ld2450
+
+switch:
+  - platform: ld2450
+    ld2450_id: ${ld2450_component_id}
+    bluetooth:
+      name: LD2450 Bluetooth
+    multi_target:
+      name: LD2450 Multi-Target

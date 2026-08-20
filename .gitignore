@@ -1,0 +1,8 @@
+.esphome/
+.venv/
+__pycache__/
+.pytest_cache/
+secrets.yaml
+data/
+*.csv
+*.bin

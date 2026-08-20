@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install ESPHome
+        run: python -m pip install esphome==2026.6.1
+
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Create synthetic build secrets
+        run: |
+          python - <<'PY'
+          import base64
+          import pathlib
+
+          key = base64.b64encode(bytes(range(32))).decode()
+          common = (
+              "wifi_ssid: Test Network\n"
+              "wifi_password: test-only-password\n"
+              f"api_encryption_key: {key}\n"
+              "ota_password: test-only-ota-password\n"
+          )
+          pathlib.Path("examples/secrets.yaml").write_text(
+              common,
+              encoding="utf-8",
+          )
+          pathlib.Path("examples/ble-presence/secrets.yaml").write_text(
+              common
+              + "ble_presence_uuid: 00000000-0000-0000-0000-000000000001\n"
+              + "ble_presence_major: 100\n"
+              + "ble_presence_minor: 1\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Validate radar-only ESPHome example
+        run: esphome config examples/esp32-c3.yaml
+
+      - name: Validate radar plus BLE ESPHome example
+        run: esphome config examples/ble-presence/esp32-c3.yaml
+
+      - name: Compile radar-only ESPHome example
+        run: esphome compile examples/esp32-c3.yaml
+
+      - name: Compile radar plus BLE ESPHome example
+        run: esphome compile examples/ble-presence/esp32-c3.yaml

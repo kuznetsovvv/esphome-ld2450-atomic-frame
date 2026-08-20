@@ -1,0 +1,44 @@
+substitutions:
+  ble_presence_name: BLE Beacon Presence
+  ble_rssi_name: BLE Beacon RSSI
+  ble_scan_name: ESP32 BLE Scan
+  ble_presence_timeout: 30s
+  ble_scan_interval: 200ms
+  ble_scan_window: 100ms
+
+esp32_ble_tracker:
+  scan_parameters:
+    continuous: false
+    interval: ${ble_scan_interval}
+    window: ${ble_scan_window}
+    active: false
+
+binary_sensor:
+  - platform: ble_presence
+    ibeacon_uuid: !secret ble_presence_uuid
+    ibeacon_major: !secret ble_presence_major
+    ibeacon_minor: !secret ble_presence_minor
+    name: ${ble_presence_name}
+    id: ble_presence_beacon
+    timeout: ${ble_presence_timeout}
+
+sensor:
+  - platform: ble_rssi
+    ibeacon_uuid: !secret ble_presence_uuid
+    ibeacon_major: !secret ble_presence_major
+    ibeacon_minor: !secret ble_presence_minor
+    name: ${ble_rssi_name}
+    id: ble_presence_rssi
+
+switch:
+  - platform: template
+    name: ${ble_scan_name}
+    id: ble_presence_scan
+    icon: mdi:bluetooth-settings
+    optimistic: true
+    restore_mode: ALWAYS_ON
+    turn_on_action:
+      - esp32_ble_tracker.start_scan:
+          continuous: true
+    turn_off_action:
+      - esp32_ble_tracker.stop_scan:

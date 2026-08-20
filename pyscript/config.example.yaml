@@ -1,0 +1,6 @@
+apps:
+  ld2450_atomic_logger:
+    frame_entity: sensor.ld2450_atomic_frame
+    output_csv: /config/ld2450_frames.csv
+    flush_seconds: 5
+    max_buffer_rows: 5000

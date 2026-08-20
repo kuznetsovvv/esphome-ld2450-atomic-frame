@@ -1,0 +1,13 @@
+substitutions:
+  device_name: ld2450-atomic-frame-ble
+  friendly_name: LD2450 Atomic Frame with BLE Presence
+  ble_presence_name: BLE Beacon Presence
+  ble_rssi_name: BLE Beacon RSSI
+  ble_scan_name: ESP32 BLE Scan
+  ble_presence_timeout: 30s
+  ble_scan_interval: 200ms
+  ble_scan_window: 100ms
+
+packages:
+  atomic_frame_device: !include ../esp32-c3.yaml
+  ble_presence: !include ../../packages/ble-presence.yaml
