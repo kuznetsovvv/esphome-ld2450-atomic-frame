@@ -8,11 +8,11 @@ privately customized **SCREEK Human Sensor 2A** firmware build:
 - using the SCREEK 2A's ESP32-C3 radio for optional passive BLE presence while
    keeping that radio distinct from the LD2450 module's own Bluetooth radio
 
-The private modified SCREEK firmware is not included here. Instead, this
-repository reimplements those capabilities from scratch with ESPHome's public
-native components. The result is a minimal, buildable demonstration of what the
-SCREEK 2A and similar ESP32-C3 + LD2450 hardware can do, not a redistribution of
-SCREEK firmware.
+The small packages in this repository reimplement those capabilities from
+scratch with ESPHome's public native components. A separate, full SCREEK-derived
+example is now also included under `examples/screek-2a/`, following SCREEK's
+addition of an MIT license. It is much closer to the private firmware used to
+exercise the features while replacing all private identifiers and credentials.
 
 The atomic frame modification publishes:
 
@@ -27,10 +27,11 @@ which runs after a complete periodic frame has been parsed.
 ## Status
 
 Experimental release candidate. The capabilities have been exercised on physical
-SCREEK 2A hardware through the author's private customized firmware. The
-independently written clean-room examples in this repository both compile with
-ESPHome 2026.6.1, but those examples have not yet been flashed to physical
-hardware. Results from the private derivative do not replace that validation.
+SCREEK 2A hardware through the author's private customized firmware. The two
+clean-room examples and sanitized SCREEK-derived full example compile with
+ESPHome 2026.6.1, but these exact public files have not yet been flashed to
+physical hardware. Results from the private derivative do not replace that
+validation.
 
 ## Important warning
 
@@ -61,25 +62,24 @@ coordinates, and all three slots in one state update.
 ## Clean-room provenance
 
 The functionality documented here was first developed and exercised in a private
-modification of the SCREEK 2A firmware. That derivative remains private. The
-packages in this repository were separately written from scratch against
-ESPHome's public native components. They do not contain SCREEK YAML, source
-snippets, or firmware binaries.
-
-The modified SCREEK build cannot be published under an assumed license because
-the upstream repository currently has no LICENSE file. Explicit redistribution
-permission has been requested in
+modification of the SCREEK 2A firmware. SCREEK subsequently added an MIT license
+and welcomed modified builds in
 [screekworkshop/screek-human-sensor#46](https://github.com/screekworkshop/screek-human-sensor/issues/46).
 
-This separation is intentional: the private build shows how the modifications
-behave on the actual product, while this repository provides independently
-reviewable examples of the underlying hardware capabilities.
+The portable packages remain independently written clean-room implementations.
+`examples/screek-2a/esp32-c3.yaml` is explicitly a derivative of SCREEK's stable
+YAML, pins the upstream commit, and preserves SCREEK's copyright/license in
+`LICENSES/SCREEK-MIT.txt`. No firmware binaries are distributed.
 
 ## Project scope
 
 This repository deliberately stops at the firmware and atomic-frame transport
 boundary. It contains the ESPHome producer, frame specification, parser,
 optional generic CSV logger, an optional ESP32 BLE presence package, and tests.
+
+For SCREEK 2A owners, [docs/screek-2a-derivative.md](docs/screek-2a-derivative.md)
+documents the fuller derivative with vendor entities/zones, direct LD2450 chip
+control/read-back, BLE presence, diagnostics, and hardened credentials.
 
 Radar-lab analytics such as target association, ghost rejection, trajectory
 classification, and geometry tuning belong in a separate repository. They have

@@ -1,12 +1,18 @@
 # Provenance and third-party notice
 
-The code and documentation in this repository were written as a clean-room
+Most code and documentation in this repository were written as a clean-room
 implementation against ESPHome's public native component APIs, including
 `ld2450`, `esp32_ble_tracker`, `ble_presence`, and `ble_rssi`.
 
+The exception is `examples/screek-2a/esp32-c3.yaml`, which is derived from
+SCREEK Workshop's Human Sensor 2A YAML at commit
+`396e597e99a4ab9902e3fc09df515a892b38e3ef`. SCREEK licensed that source under
+MIT after the clarification in issue #46. The upstream copyright and permission
+notice are preserved in `LICENSES/SCREEK-MIT.txt`.
+
 This repository does **not** contain:
 
-- SCREEK Workshop YAML or firmware binaries
+- SCREEK firmware binaries or unlicensed SCREEK source
 - Hi-Link firmware or app code
 - vendor credentials or OTA passwords
 - real Bluetooth identifiers or presence history
@@ -25,5 +31,5 @@ Hi-Link, LD2450, SCREEK, Home Assistant, and ESPHome names may be trademarks of
 their respective owners. This project is unofficial and is not affiliated with
 or endorsed by those projects or vendors.
 
-SCREEK-compatible derivative redistribution is being discussed separately in:
+SCREEK's license clarification and permission history are recorded in:
 https://github.com/screekworkshop/screek-human-sensor/issues/46

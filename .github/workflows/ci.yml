@@ -49,6 +49,19 @@ jobs:
               + "ble_presence_minor: 1\n",
               encoding="utf-8",
           )
+          pathlib.Path("examples/screek-2a/secrets.yaml").write_text(
+              common
+              + "fallback_ap_password: test-only-recovery-password\n"
+              + "web_username: test-user\n"
+              + "web_password: test-only-web-password\n"
+              + "ble_beacon_1_uuid: 00000000-0000-0000-0000-000000000001\n"
+              + "ble_beacon_1_major: 100\n"
+              + "ble_beacon_1_minor: 1\n"
+              + "ble_beacon_2_uuid: 00000000-0000-0000-0000-000000000002\n"
+              + "ble_beacon_2_major: 100\n"
+              + "ble_beacon_2_minor: 2\n",
+              encoding="utf-8",
+          )
           PY
 
       - name: Validate radar-only ESPHome example
@@ -57,8 +70,14 @@ jobs:
       - name: Validate radar plus BLE ESPHome example
         run: esphome config examples/ble-presence/esp32-c3.yaml
 
+      - name: Validate SCREEK-derived ESPHome example
+        run: esphome config examples/screek-2a/esp32-c3.yaml
+
       - name: Compile radar-only ESPHome example
         run: esphome compile examples/esp32-c3.yaml
 
       - name: Compile radar plus BLE ESPHome example
         run: esphome compile examples/ble-presence/esp32-c3.yaml
+
+      - name: Compile SCREEK-derived ESPHome example
+        run: esphome compile examples/screek-2a/esp32-c3.yaml

@@ -1,0 +1,1963 @@
+# SCREEK Human Sensor 2A derivative: atomic LD2450 frames, direct chip control,
+# optional ESP32 BLE presence, and performance diagnostics.
+#
+# Upstream source:
+# https://github.com/screekworkshop/screek-human-sensor/blob/396e597e99a4ab9902e3fc09df515a892b38e3ef/2a/yaml/human-sensor-2a-stable-github.yaml
+# Copyright (c) 2026 screekworkshop
+# Modifications copyright (c) 2026 kuznetsovvv and contributors
+# SPDX-License-Identifier: MIT
+# See ../../LICENSE and ../../LICENSES/SCREEK-MIT.txt.
+#
+# The feature lineage was exercised on a SCREEK 2A using private firmware. This
+# public derivative removes real identifiers, replaces credentials, and suppresses
+# MAC publication, so this exact sanitized file still requires physical validation.
+# It is unofficial and is not supported or endorsed by SCREEK Workshop.
+#
+# Adding the BLE stack can change the flash partition layout. Treat the first
+# installation as a USB/serial flash unless OTA compatibility is independently
+# verified, and keep a known-good recovery image.
+
+substitutions:
+  device_name: screek-2a-atomic-frame
+  friendly_name: SCREEK 2A Atomic Frame
+  beacon_1_name: BLE Beacon 1
+  beacon_2_name: BLE Beacon 2
+  ble_presence_timeout: 30s
+  ble_presence_min_rssi: -80dB
+
+# This is a custom firmware for Human Presence Sensor 2A
+# https://docs.screek.io/2a
+
+esphome:
+  name: ${device_name}
+  comment: Unofficial SCREEK Human Sensor 2A derivative
+  friendly_name: ${friendly_name}
+  min_version: 2026.6.1
+  name_add_mac_suffix: False
+  platformio_options:
+    board_build.flash_mode: dio
+    # board_build.f_cpu: 80000000L
+  project:
+    name: kuznetsovvv.screek_2a_atomic_frame
+    version: 0.1.0
+  on_boot:
+    - priority: -200
+      then:
+        lambda: |-
+          id(zone1_target_exsits).publish_state(false);
+          id(zone2_target_exsits).publish_state(false);
+          id(zone3_target_exsits).publish_state(false);
+          id(zone_ex1_target_exsits).publish_state(false);
+    # On every boot, QUERY the chip so the read-back entities (BT state, version, mode, zone
+    # type) auto-populate — and so "LD2450 Bluetooth Active" reflects reality after each boot
+    # (you can alert on it flipping back on). The LD2450 PERSISTS bt-off in its OWN flash across
+    # reboots/power-cycles (verified 2026-06-29), so re-disabling every boot is NOT needed and
+    # would cost a ~1.5s radar gap. BT only re-enables after an LD2450 FACTORY RESET — if you
+    # ever do that, press "LD2450 Bluetooth Disable" again (or swap the query below for the
+    # disable script: id: ld2450_cmd_bt / enable: false).
+    - priority: -300
+      then:
+        - delay: 8s
+        - script.execute: ld2450_cmd_query
+
+preferences:
+    flash_write_interval: 5s
+
+esp32:
+  board: lolin_c3_mini
+  framework:
+    type: esp-idf
+
+globals:
+  - id: last_update_ld2450
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+  # restart-recovery measurement: track the MAX inter-frame gap in a window after a 0xA3
+  # restart (the reboot = one big gap; normal frames are ms apart). last_frame_seen_ms updates
+  # on EVERY periodic frame (before the publish throttle); restart_watch_until_ms != 0 arms it.
+  - id: last_frame_seen_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+  - id: restart_watch_until_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+  - id: restart_max_gap_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+  - id: init_zone_publish
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: last_illuminance
+    type: float
+    restore_value: no
+    initial_value: "-1"
+  - id: last_illuminance_timestamp
+    type: int
+    restore_value: no
+    initial_value: "-1"
+
+improv_serial:
+
+logger:
+
+debug:
+  update_interval: 10s
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+safe_mode:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: LIGHT
+  reboot_timeout: 10min
+  ap:
+    ssid: "SCREEK 2A Recovery"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  auth:
+    username: !secret web_username
+    password: !secret web_password
+  ota: false
+
+# === BLE (2026-08-07): esp32_ble_tracker for beacon presence + contention testing.
+# continuous:false => stack present but NOT scanning at boot (= "BLE stack idle";
+# diff vs the no-BLE instr baseline = idle-stack cost). Passive scan (active:false)
+# = lighter radio duty; iBeacon adverts don't need scan-requests. Turn scanning on
+# via switch.ble_scan. First flash of THIS build needs USB (partition resize).
+esp32_ble_tracker:
+  scan_parameters:
+    continuous: false
+    # 2026-08-11: duty raised 9% -> 50% (window 100 / interval 200) for the contention
+    # perf test + ~5x better iBeacon capture up close. C3 shares ONE radio between WiFi
+    # and BLE (time-mux coex), so 50% duty measurably taxes WiFi - that's the experiment.
+    # NOT 100% (window==interval) which would starve WiFi. Passive: iBeacon adverts are
+    # connectionless, no scan-requests needed (lighter radio load).
+    interval: 200ms
+    window: 100ms
+    active: false
+
+text_sensor:
+  # --- ATOMIC FRAME (2026-08-07): coherent, device-timestamped radar frame,
+  # published imperatively from the UART lambda. Payload
+  # "t_ms|x1,y1,v1|x2,y2,v2|x3,y3,v3" in RAW mm. Consumed by pyscript radar_frame.py.
+  # Present-gated in the lambda, but still recorder-heavy under motion => exclude
+  # from recorder + consume live via pyscript if DB growth matters.
+  - platform: template
+    name: "Radar Frame"
+    id: radar_frame
+    entity_category: diagnostic
+  - platform: debug
+    reset_reason:
+      name: "ESP Reset Reason"
+      icon: mdi:anchor
+      disabled_by_default: True
+  - platform: wifi_info
+    ip_address:
+      name: ESP IP Address
+      entity_category: "diagnostic"
+      disabled_by_default: True
+      icon: mdi:ip-network
+  - platform: template
+    name: "Zone1 Info"
+    id: tips_zone1_conf
+    icon: mdi:information-outline
+    entity_category: config
+    lambda: |-
+      return {"Configure below" };
+    update_interval: 1000s
+  - platform: template
+    name: "Zone2 Info"
+    id: tips_zone2_conf
+    icon: mdi:information-outline
+    entity_category: config
+    lambda: |-
+      return {"Configure below" };
+    update_interval: 1000s
+  - platform: template
+    name: "Zone3 Info"
+    id: tips_zone3_conf
+    icon: mdi:information-outline
+    entity_category: config
+    lambda: |-
+      return {"Configure below" };
+    update_interval: 1000s
+  - platform: template
+    name: "Zout1 Info"
+    id: tips_zone_ex1_conf
+    icon: mdi:information-outline
+    entity_category: config
+    lambda: |-
+      return {"Zone Exclusion 1" };
+    update_interval: 1000s
+  - platform: template
+    name: "Any-Presence Info"
+    id: tips_any_presence_conf
+    icon: mdi:information-outline
+    entity_category: config
+    lambda: |-
+      return {"Any Presence Config" };
+    update_interval: 1000s
+  - platform: template
+    name: "Target1 Direction"
+    id: target1_direction
+    icon: mdi:directions
+  - platform: template
+    name: "Target2 Direction"
+    id: target2_direction
+    icon: mdi:directions
+  - platform: template
+    name: "Target3 Direction"
+    id: target3_direction
+    icon: mdi:directions
+  - platform: template
+    name: "Target1 Position"
+    id: target1_position
+    icon: mdi:directions
+  - platform: template
+    name: "Target2 Position"
+    id: target2_position
+    icon: mdi:directions
+  - platform: template
+    name: "Target3 Position"
+    id: target3_position
+    icon: mdi:directions
+
+  # ---- LD2450 chip read-back (values published by the UART ACK parser in uart:) ----
+  - platform: template
+    name: "LD2450 Chip Version"
+    id: chip_ld2450_version
+    icon: mdi:chip
+    entity_category: diagnostic
+  - platform: template
+    name: "LD2450 Target Mode (chip)"
+    id: chip_target_mode
+    icon: mdi:account-multiple
+    entity_category: diagnostic
+  - platform: template
+    name: "LD2450 Zone Type (chip)"
+    id: chip_zone_type_state
+    icon: mdi:select-group
+    entity_category: diagnostic
+
+number:
+  # ---- runtime LD2450 publish throttle (replaces the hardcoded 50ms gate) ----
+  # 0 = no throttle (chip's native ~10-12 Hz becomes the ceiling). Safe: the gate is
+  # an unsigned compare, no division. Lower = higher rate + more WiFi/API load on the C3.
+  - platform: template
+    name: "LD2450 Publish Throttle"
+    id: ld2450_throttle_ms
+    min_value: 0
+    max_value: 1000
+    step: 10
+    mode: box
+    unit_of_measurement: ms
+    icon: mdi:speedometer
+    entity_category: config
+    optimistic: True
+    initial_value: 50
+    restore_value: True
+  # ---- on-chip region filter coords (mm), 3 regions. Apply via "LD2450 Set Region Filter".
+  # The chip filter is HARDWARE-level: in Filter mode the LD2450 STOPS REPORTING targets inside
+  # these boxes (so a filtered reflection never consumes a target slot). The Zone Type select
+  # mode (Disabled/Detection/Filter) is GLOBAL across all 3 regions. Unused regions = leave 0.
+  - platform: template
+    name: "LD2450 Region1 X1"
+    id: chip_region1_x1
+    min_value: -4000
+    max_value: 4000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-left-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region1 Y1"
+    id: chip_region1_y1
+    min_value: 0
+    max_value: 6000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-up-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region1 X2"
+    id: chip_region1_x2
+    min_value: -4000
+    max_value: 4000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-right-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region1 Y2"
+    id: chip_region1_y2
+    min_value: 0
+    max_value: 6000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-down-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region2 X1"
+    id: chip_region2_x1
+    min_value: -4000
+    max_value: 4000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-left-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region2 Y1"
+    id: chip_region2_y1
+    min_value: 0
+    max_value: 6000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-up-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region2 X2"
+    id: chip_region2_x2
+    min_value: -4000
+    max_value: 4000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-right-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region2 Y2"
+    id: chip_region2_y2
+    min_value: 0
+    max_value: 6000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-down-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region3 X1"
+    id: chip_region3_x1
+    min_value: -4000
+    max_value: 4000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-left-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region3 Y1"
+    id: chip_region3_y1
+    min_value: 0
+    max_value: 6000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-up-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region3 X2"
+    id: chip_region3_x2
+    min_value: -4000
+    max_value: 4000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-right-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "LD2450 Region3 Y2"
+    id: chip_region3_y2
+    min_value: 0
+    max_value: 6000
+    step: 10
+    mode: box
+    unit_of_measurement: mm
+    icon: mdi:arrow-down-bold
+    entity_category: config
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "Any Presence Timeout"
+    id: any_presence_timeout
+    min_value: 0
+    max_value: 1800
+    mode: box
+    device_class: duration
+    entity_category: config
+    unit_of_measurement: s
+    icon: mdi:timer-off
+    step: 1
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "Zone1 Timeout"
+    id: zone1_x_timeout
+    min_value: 0
+    max_value: 1800
+    mode: box
+    device_class: duration
+    entity_category: config
+    unit_of_measurement: s
+    icon: mdi:timer-off
+    step: 1
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "Zone2 Timeout"
+    id: zone2_x_timeout
+    min_value: 0
+    max_value: 1800
+    mode: box
+    device_class: duration
+    entity_category: config
+    unit_of_measurement: s
+    icon: mdi:timer-off
+    step: 1
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  - platform: template
+    name: "Zone3 Timeout"
+    id: zone3_x_timeout
+    min_value: 0
+    max_value: 1800
+    mode: box
+    device_class: duration
+    entity_category: config
+    unit_of_measurement: s
+    icon: mdi:timer-off
+    step: 1
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+  # Zone 1
+  - platform: template
+    name: Zone1 X-Begin
+    id: zone1_x_begin
+    min_value: -4000
+    max_value: 4000
+    mode: box
+    device_class: distance
+    entity_category: config
+    unit_of_measurement: mm
+    icon: mdi:arrow-left-bold
+    step: 10
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone1_vaild
+  - platform: template
+    name: Zone1 X-End
+    id: zone1_x_end
+    mode: box
+    min_value: -4000
+    max_value: 4000
+    device_class: distance
+    unit_of_measurement: mm
+    entity_category: config
+    icon: mdi:arrow-right-bold
+    step: 10
+    initial_value: 0
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone1_vaild
+  - platform: template
+    name: Zone1 Y-Begin
+    id: zone1_y_begin
+    mode: box
+    min_value: 0
+    max_value: 6000
+    device_class: distance
+    entity_category: config
+    icon: mdi:arrow-up-bold
+    unit_of_measurement: mm
+    step: 10
+    initial_value: 0
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone1_vaild
+  - platform: template
+    name: Zone1 Y-End
+    id: zone1_y_end
+    icon: mdi:arrow-down-bold
+    mode: box
+    min_value: 0
+    max_value: 6000
+    initial_value: 0
+    entity_category: config
+    device_class: distance
+    unit_of_measurement: mm
+    step: 10
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone1_vaild
+
+  # Zone 2
+  - platform: template
+    name: Zone2 X-Begin
+    id: zone2_x_begin
+    min_value: -4000
+    max_value: 4000
+    mode: box
+    device_class: distance
+    entity_category: config
+    unit_of_measurement: mm
+    icon: mdi:arrow-left-bold
+    step: 10
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone2_vaild
+  - platform: template
+    name: Zone2 X-End
+    id: zone2_x_end
+    mode: box
+    min_value: -4000
+    max_value: 4000
+    device_class: distance
+    unit_of_measurement: mm
+    entity_category: config
+    icon: mdi:arrow-right-bold
+    step: 10
+    initial_value: 0
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone2_vaild
+  - platform: template
+    name: Zone2 Y-Begin
+    id: zone2_y_begin
+    mode: box
+    min_value: 0
+    max_value: 6000
+    device_class: distance
+    entity_category: config
+    icon: mdi:arrow-up-bold
+    unit_of_measurement: mm
+    step: 10
+    initial_value: 0
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone2_vaild
+  - platform: template
+    name: Zone2 Y-End
+    id: zone2_y_end
+    icon: mdi:arrow-down-bold
+    mode: box
+    min_value: 0
+    max_value: 6000
+    initial_value: 0
+    entity_category: config
+    device_class: distance
+    unit_of_measurement: mm
+    step: 10
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone2_vaild
+
+  # Zone 3
+  - platform: template
+    name: Zone3 X-Begin
+    id: zone3_x_begin
+    min_value: -4000
+    max_value: 4000
+    mode: box
+    device_class: distance
+    entity_category: config
+    unit_of_measurement: mm
+    icon: mdi:arrow-left-bold
+    step: 10
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone3_vaild
+  - platform: template
+    name: Zone3 X-End
+    id: zone3_x_end
+    mode: box
+    min_value: -4000
+    max_value: 4000
+    device_class: distance
+    unit_of_measurement: mm
+    entity_category: config
+    icon: mdi:arrow-right-bold
+    step: 10
+    initial_value: 0
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone3_vaild
+  - platform: template
+    name: Zone3 Y-Begin
+    id: zone3_y_begin
+    mode: box
+    min_value: 0
+    max_value: 6000
+    device_class: distance
+    entity_category: config
+    icon: mdi:arrow-up-bold
+    unit_of_measurement: mm
+    step: 10
+    initial_value: 0
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone3_vaild
+  - platform: template
+    name: Zone3 Y-End
+    id: zone3_y_end
+    icon: mdi:arrow-down-bold
+    mode: box
+    min_value: 0
+    max_value: 6000
+    initial_value: 0
+    entity_category: config
+    device_class: distance
+    unit_of_measurement: mm
+    step: 10
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zone3_vaild
+
+  # Zout1
+  - platform: template
+    name: Zout1 X-Begin
+    id: zone_ex1_x_begin
+    min_value: -4000
+    max_value: 4000
+    mode: box
+    device_class: distance
+    entity_category: config
+    unit_of_measurement: mm
+    icon: mdi:arrow-left-bold
+    step: 10
+    optimistic: True
+    initial_value: 0
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zout1_vaild
+  - platform: template
+    name: Zout1 X-End
+    id: zone_ex1_x_end
+    mode: box
+    min_value: -4000
+    max_value: 4000
+    device_class: distance
+    unit_of_measurement: mm
+    entity_category: config
+    icon: mdi:arrow-right-bold
+    step: 10
+    initial_value: 0
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zout1_vaild
+  - platform: template
+    name: Zout1 Y-Begin
+    id: zone_ex1_y_begin
+    mode: box
+    min_value: 0
+    max_value: 6000
+    device_class: distance
+    entity_category: config
+    icon: mdi:arrow-up-bold
+    unit_of_measurement: mm
+    step: 10
+    initial_value: 0
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zout1_vaild
+  - platform: template
+    name: Zout1 Y-End
+    id: zone_ex1_y_end
+    icon: mdi:arrow-down-bold
+    mode: box
+    min_value: 0
+    max_value: 6000
+    initial_value: 0
+    entity_category: config
+    device_class: distance
+    unit_of_measurement: mm
+    step: 10
+    optimistic: True
+    restore_value: True
+    on_value:
+      then:
+        - script.execute: check_zout1_vaild
+
+binary_sensor:
+  # --- Optional BLE presence. Each UUID/major/minor tuple must be unique and
+  # private. The -80 dBm default mirrors the tested derivative but is only a
+  # starting point; calibrate it for the beacon, enclosure, and RF environment.
+  - platform: ble_presence
+    ibeacon_uuid: !secret ble_beacon_1_uuid
+    ibeacon_major: !secret ble_beacon_1_major
+    ibeacon_minor: !secret ble_beacon_1_minor
+    name: "${beacon_1_name} Present"
+    id: ble_beacon_1_present
+    timeout: ${ble_presence_timeout}
+    min_rssi: ${ble_presence_min_rssi}
+  - platform: ble_presence
+    ibeacon_uuid: !secret ble_beacon_2_uuid
+    ibeacon_major: !secret ble_beacon_2_major
+    ibeacon_minor: !secret ble_beacon_2_minor
+    name: "${beacon_2_name} Present"
+    id: ble_beacon_2_present
+    timeout: ${ble_presence_timeout}
+    min_rssi: ${ble_presence_min_rssi}
+  - platform: status
+    name: Online
+    id: ink_ha_connected
+  - platform: template
+    name: "Any Presence"
+    id: any_target_exsits
+    device_class: occupancy
+    filters:
+      - delayed_off: !lambda |-
+          if (!id(init_zone_publish) || !id(zone_fn_enable).state) {
+            return 0;
+          };
+          return id(any_presence_timeout).state * 1000.0;
+  - platform: template
+    name: "Zone1 Presence"
+    id: zone1_target_exsits
+    device_class: occupancy
+    filters:
+      - delayed_off: !lambda |-
+          if (!id(init_zone_publish) || !id(zone_fn_enable).state) {
+            return 0;
+          }
+          return id(zone1_x_timeout).state * 1000.0;
+  - platform: template
+    name: "Zone2 Presence"
+    id: zone2_target_exsits
+    device_class: occupancy
+    filters:
+      - delayed_off: !lambda |-
+          if (!id(init_zone_publish) || !id(zone_fn_enable).state) {
+            return 0;
+          }
+          return id(zone2_x_timeout).state * 1000.0;
+  - platform: template
+    name: "Zone3 Presence"
+    id: zone3_target_exsits
+    device_class: occupancy
+    filters:
+      - delayed_off: !lambda |-
+          if (!id(init_zone_publish) || !id(zone_fn_enable).state) {
+            return 0;
+          }
+          return id(zone3_x_timeout).state * 1000.0;
+  - platform: template
+    name: "Zout1 Presence"
+    id: zone_ex1_target_exsits
+    icon: mdi:account-multiple-remove
+    device_class: occupancy
+  # Actual chip Bluetooth state, inferred from the MAC-query response without
+  # publishing the hardware address.
+  - platform: template
+    name: "LD2450 Bluetooth Active"
+    id: chip_bt_active
+    icon: mdi:bluetooth
+    device_class: connectivity
+    entity_category: diagnostic
+
+i2c:
+  sda: GPIO7
+  scl: GPIO11
+  scan: true
+  id: bus_a
+
+script:
+  - id: check_zone1_vaild
+    then:
+      - lambda: |-
+          if (id(zone1_x_begin).state > id(zone1_x_end).state){
+            id(tips_zone1_conf).publish_state("Err: X-Begin > X-End");
+            return;
+          }
+          if (id(zone1_y_begin).state > id(zone1_y_end).state){
+            id(tips_zone1_conf).publish_state("Err: Y-Begin > Y-End");
+            return;
+          }
+          if (id(zone1_x_begin).state == 0 && id(zone1_x_end).state == 0 && id(zone1_y_begin).state == 0 && id(zone1_y_end).state == 0){
+            id(tips_zone1_conf).publish_state("Configure below");
+            return;
+          }
+
+          int x_size = id(zone1_x_end).state - id(zone1_x_begin).state;
+          int y_size = id(zone1_y_end).state - id(zone1_y_begin).state;
+
+          char combined[80];
+          sprintf(combined, "Curr Size: %d x %d", x_size, y_size);
+          id(tips_zone1_conf).publish_state(combined);
+  - id: check_zone2_vaild
+    then:
+      - lambda: |-
+          if (id(zone2_x_begin).state > id(zone2_x_end).state){
+            id(tips_zone2_conf).publish_state("Err: X-Begin > X-End");
+            return;
+          }
+          if (id(zone2_y_begin).state > id(zone2_y_end).state){
+            id(tips_zone2_conf).publish_state("Err: Y-Begin > Y-End");
+            return;
+          }
+          if (id(zone2_x_begin).state == 0 && id(zone2_x_end).state == 0 && id(zone2_y_begin).state == 0 && id(zone2_y_end).state == 0){
+            id(tips_zone2_conf).publish_state("Configure below");
+            return;
+          }
+
+          int x_size = id(zone2_x_end).state - id(zone2_x_begin).state;
+          int y_size = id(zone2_y_end).state - id(zone2_y_begin).state;
+
+          char combined[80];
+          sprintf(combined, "Curr Size: %d x %d", x_size, y_size);
+          id(tips_zone2_conf).publish_state(combined);
+  - id: check_zone3_vaild
+    then:
+      - lambda: |-
+          if (id(zone3_x_begin).state > id(zone3_x_end).state){
+            id(tips_zone3_conf).publish_state("Err: X-Begin > X-End");
+            return;
+          }
+          if (id(zone3_y_begin).state > id(zone3_y_end).state){
+            id(tips_zone3_conf).publish_state("Err: Y-Begin > Y-End");
+            return;
+          }
+          if (id(zone3_x_begin).state == 0 && id(zone3_x_end).state == 0 && id(zone3_y_begin).state == 0 && id(zone3_y_end).state == 0){
+            id(tips_zone3_conf).publish_state("Configure below");
+            return;
+          }
+
+          int x_size = id(zone3_x_end).state - id(zone3_x_begin).state;
+          int y_size = id(zone3_y_end).state - id(zone3_y_begin).state;
+
+          char combined[80];
+          sprintf(combined, "Curr Size: %d x %d", x_size, y_size);
+          id(tips_zone3_conf).publish_state(combined);
+  - id: check_zout1_vaild
+    then:
+      - lambda: |-
+          if (id(zone_ex1_x_begin).state > id(zone_ex1_x_end).state){
+            id(tips_zone_ex1_conf).publish_state("Err: X-Begin > X-End");
+            return;
+          }
+          if (id(zone_ex1_y_begin).state > id(zone_ex1_y_end).state){
+            id(tips_zone_ex1_conf).publish_state("Err: Y-Begin > Y-End");
+            return;
+          }
+          id(tips_zone_ex1_conf).publish_state("Zone Exclusion 1");
+
+  # ===== LD2450 chip command scaffolding =====
+  # Framing verified against esphome/esphome components/ld2450 (dev) 2026-06-29:
+  #   Frame: FD FC FB FA | length(LE16) | command(LE16) | value... | 04 03 02 01
+  #   Config gate: enable = cmd 0x00FF value {01 00}; end = cmd 0x00FE no value.
+  # ACK responses are decoded by the realign parser in uart: -> chip_* read-back entities.
+  - id: ld2450_cmd_bt
+    parameters:
+      enable: bool
+    mode: queued
+    then:
+      - lambda: |-
+          const uint8_t en[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(en, sizeof(en));
+      - delay: 80ms
+      - lambda: |-
+          uint8_t v = enable ? 0x01 : 0x00;
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xA4,0x00, v,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));
+      - delay: 80ms
+      - lambda: |-
+          // restart the module so the BT change takes effect
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xA3,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));
+      - delay: 1500ms
+      - script.execute: ld2450_cmd_query
+  - id: ld2450_cmd_multi
+    parameters:
+      enable: bool
+    mode: queued
+    then:
+      - lambda: |-
+          const uint8_t en[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(en, sizeof(en));
+      - delay: 80ms
+      - lambda: |-
+          uint8_t cmd = enable ? 0x90 : 0x80;   // 0x90 multi, 0x80 single
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, cmd,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));
+      - delay: 80ms
+      - lambda: |-
+          const uint8_t de[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xFE,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(de, sizeof(de));
+      - delay: 150ms
+      - script.execute: ld2450_cmd_query
+  - id: ld2450_cmd_set_region
+    mode: queued
+    then:
+      - lambda: |-
+          const uint8_t en[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(en, sizeof(en));
+      - delay: 80ms
+      - lambda: |-
+          uint8_t zt = 0;
+          auto opt = id(chip_zone_type).current_option();
+          if (opt == "Detection") { zt = 1; } else if (opt == "Filter") { zt = 2; }
+          // SET_ZONE value = zone_type(LE16) + 3 regions x {x1,y1,x2,y2} as LE16 two's-
+          // complement (DIFFERENT encoding from the periodic-data sign bit!). Mode is global.
+          int16_t r[12] = {
+            (int16_t) id(chip_region1_x1).state, (int16_t) id(chip_region1_y1).state,
+            (int16_t) id(chip_region1_x2).state, (int16_t) id(chip_region1_y2).state,
+            (int16_t) id(chip_region2_x1).state, (int16_t) id(chip_region2_y1).state,
+            (int16_t) id(chip_region2_x2).state, (int16_t) id(chip_region2_y2).state,
+            (int16_t) id(chip_region3_x1).state, (int16_t) id(chip_region3_y1).state,
+            (int16_t) id(chip_region3_x2).state, (int16_t) id(chip_region3_y2).state };
+          uint8_t f[38];
+          f[0]=0xFD; f[1]=0xFC; f[2]=0xFB; f[3]=0xFA;
+          f[4]=0x1C; f[5]=0x00;          // length = 28 (2 command + 26 value)
+          f[6]=0xC2; f[7]=0x00;          // CMD_SET_ZONE
+          f[8]=zt;   f[9]=0x00;          // zone type (global across all 3 regions)
+          for (int i=0;i<12;i++) {
+            uint16_t u = (uint16_t) r[i];
+            f[10 + i*2]     = u & 0xFF;   // little-endian
+            f[10 + i*2 + 1] = (u >> 8) & 0xFF;
+          }
+          f[34]=0x04; f[35]=0x03; f[36]=0x02; f[37]=0x01;
+          id(uart_bus).write_array(f, 38);
+      - delay: 80ms
+      - lambda: |-
+          const uint8_t de[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xFE,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(de, sizeof(de));
+      - delay: 150ms
+      - script.execute: ld2450_cmd_query
+  - id: ld2450_cmd_query
+    mode: queued
+    then:
+      - lambda: |-
+          const uint8_t en[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(en, sizeof(en));
+      - delay: 80ms
+      - lambda: |-
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xA0,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));   // query firmware version
+      - delay: 150ms
+      - lambda: |-
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xA5,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));   // query MAC (=> Bluetooth state)
+      - delay: 150ms
+      - lambda: |-
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0x91,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));   // query target mode
+      - delay: 150ms
+      - lambda: |-
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xC1,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));   // query zone config
+      - delay: 150ms
+      - lambda: |-
+          const uint8_t de[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xFE,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(de, sizeof(de));
+  - id: ld2450_cmd_restart
+    mode: queued
+    then:
+      - lambda: |-
+          const uint8_t en[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(en, sizeof(en));
+      - delay: 80ms
+      - lambda: |-
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xA3,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));   // restart module
+          // arm the recovery stopwatch: watch the max inter-frame gap for the next 3s
+          id(last_frame_seen_ms) = millis();
+          id(restart_max_gap_ms) = 0;
+          id(restart_watch_until_ms) = millis() + 3000;
+      - delay: 3500ms
+      - script.execute: ld2450_cmd_query
+  - id: ld2450_cmd_factory
+    mode: queued
+    then:
+      - lambda: |-
+          const uint8_t en[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(en, sizeof(en));
+      - delay: 80ms
+      - lambda: |-
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xA2,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));   // factory reset (NOTE: re-enables chip BT)
+      - delay: 80ms
+      - lambda: |-
+          const uint8_t f[] = {0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xA3,0x00, 0x04,0x03,0x02,0x01};
+          id(uart_bus).write_array(f, sizeof(f));   // restart module
+      - delay: 1500ms
+      - script.execute: ld2450_cmd_query
+
+sensor:
+  # BLE RSSI updates only while each configured beacon is heard.
+  - platform: ble_rssi
+    ibeacon_uuid: !secret ble_beacon_1_uuid
+    ibeacon_major: !secret ble_beacon_1_major
+    ibeacon_minor: !secret ble_beacon_1_minor
+    name: "${beacon_1_name} RSSI"
+    id: ble_beacon_1_rssi
+  - platform: ble_rssi
+    ibeacon_uuid: !secret ble_beacon_2_uuid
+    ibeacon_major: !secret ble_beacon_2_major
+    ibeacon_minor: !secret ble_beacon_2_minor
+    name: "${beacon_2_name} RSSI"
+    id: ble_beacon_2_rssi
+  # --- INSTRUMENTATION (perf-baseline test 2026-07-28) - loop_time = CPU headroom ---
+  - platform: debug
+    free:
+      name: "ESP Heap Free (debug)"
+      id: dbg_heap_free
+    block:
+      name: "ESP Heap Max Block"
+      id: dbg_heap_block
+    loop_time:
+      name: "ESP Loop Time"
+      id: dbg_loop_time
+  - platform: internal_temperature
+    id: sys_esp_temperature
+    name: ESP Temperature
+    unit_of_measurement: °C
+    device_class: TEMPERATURE
+    update_interval: 10s
+    entity_category: "diagnostic"
+  # Measured chip-restart blackout: ms from the 0xA3 restart command to the FIRST periodic
+  # frame the LD2450 emits after (frames flow regardless of motion = the true reboot gap).
+  # Published by the UART sequence each time "LD2450 Restart" fires.
+  - platform: template
+    name: "LD2450 Restart Recovery"
+    id: chip_restart_recovery
+    icon: mdi:timer-sync-outline
+    unit_of_measurement: ms
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: uptime
+    name: ESP Uptime
+    id: sys_uptime
+    update_interval: 10s
+  - platform: wifi_signal
+    name: RSSI
+    id: wifi_signal_db
+    update_interval: 10s
+    entity_category: "diagnostic"
+  - platform: template
+    id: esp_memory
+    icon: mdi:memory
+    name: ESP Free Memory
+    lambda: return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+    unit_of_measurement: 'kB'
+    state_class: measurement
+    entity_category: "diagnostic"
+    update_interval: 10s
+  - platform: bh1750
+    name: "Illuminance"
+    accuracy_decimals: 1
+    id: bh1750_light
+    update_interval: 1s
+    force_update: true
+    filters:
+      - lambda: !lambda |-
+          auto time = id(time_now).utcnow().timestamp;
+          if (id(last_illuminance) == x){
+            if (time >= (id(last_illuminance_timestamp) + 60)){
+              id(last_illuminance_timestamp) = time;
+              return x;
+            } else {
+              return {};
+            }
+          }
+          if (id(bh1750_fast_update).state){
+            id(last_illuminance) = x;
+            // ESP_LOGD("custom", "Fast Update BH1850");
+            id(last_illuminance_timestamp) = time;
+            return x;
+          }
+          if (abs(id(last_illuminance) - x) > 1){
+
+              id(last_illuminance) = x;
+              id(last_illuminance_timestamp) = time;
+              return x;
+          }
+          return {};
+
+  #-------------------------------------#
+  # 高级雷达数据
+  - platform: template
+    name: "All Target Counts"
+    id: all_target_count
+    accuracy_decimals: 0
+    icon: "mdi:counter"
+    unit_of_measurement: "targets"
+  - platform: template
+    name: "Zone1 Target Counts"
+    id: zone1_target_count
+    accuracy_decimals: 0
+    icon: "mdi:counter"
+    unit_of_measurement: "targets"
+  - platform: template
+    name: "Zone2 Target Counts"
+    id: zone2_target_count
+    accuracy_decimals: 0
+    icon: "mdi:counter"
+    unit_of_measurement: "targets"
+  - platform: template
+    name: "Zone3 Target Counts"
+    id: zone3_target_count
+    accuracy_decimals: 0
+    icon: "mdi:counter"
+    unit_of_measurement: "targets"
+  - platform: template
+    name: "Zout1 Target Counts"
+    id: zone_ex1_target_count
+    accuracy_decimals: 0
+    icon: mdi:account-multiple-minus-outline
+    unit_of_measurement: "targets"
+
+  # Target 1
+  - platform: template
+    name: "Target1 X"
+    id: target1_x
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    icon: mdi:focus-field-horizontal
+    device_class: distance
+  - platform: template
+    name: "Target1 Y"
+    id: target1_y
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    icon: mdi:focus-field-vertical
+  - platform: template
+    name: "Target1 Speed"
+    id: target1_speed
+    accuracy_decimals: 2
+    unit_of_measurement: 'm/s'
+    state_class: measurement
+    device_class: speed
+  - platform: template
+    name: "Target1 Resolution"
+    id: target1_resolution
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+
+  # Target 2
+  - platform: template
+    name: "Target2 X"
+    id: target2_x
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    icon: mdi:focus-field-horizontal
+  - platform: template
+    name: "Target2 Y"
+    id: target2_y
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    icon: mdi:focus-field-vertical
+  - platform: template
+    name: "Target2 Speed"
+    id: target2_speed
+    accuracy_decimals: 0
+    unit_of_measurement: 'm/s'
+    state_class: measurement
+    device_class: speed
+  - platform: template
+    name: "Target2 Resolution"
+    id: target2_resolution
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+
+  # Target 3
+  - platform: template
+    name: "Target3 X"
+    id: target3_x
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    icon: mdi:focus-field-horizontal
+  - platform: template
+    name: "Target3 Y"
+    id: target3_y
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    icon: mdi:focus-field-vertical
+  - platform: template
+    name: "Target3 Speed"
+    id: target3_speed
+    accuracy_decimals: 0
+    unit_of_measurement: 'm/s'
+    state_class: measurement
+    device_class: speed
+  - platform: template
+    name: "Target3 Resolution"
+    id: target3_resolution
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+  - platform: template
+    name: "Target1 Angle"
+    id: target1_angle
+    unit_of_measurement: 'º'
+    accuracy_decimals: 1
+    icon: mdi:angle-acute
+  - platform: template
+    name: "Target2 Angle"
+    id: target2_angle
+    accuracy_decimals: 1
+    unit_of_measurement: 'º'
+    icon: mdi:angle-acute
+  - platform: template
+    name: "Target3 Angle"
+    id: target3_angle
+    accuracy_decimals: 1
+    unit_of_measurement: 'º'
+    icon: mdi:angle-acute
+
+light:
+  - platform: status_led
+    name: sys_status
+    # SCREEK 2A PCB LED wiring inherited from upstream. ESPHome flags GPIO12/13
+    # on a generic ESP32-C3, so both board-only LED pins use explicit overrides.
+    pin:
+      number: GPIO13
+      ignore_pin_validation_error: true
+    internal: True
+    restore_mode: ALWAYS_OFF
+  - platform: binary
+    name: "Red Info Light"
+    output: board_info_ed
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
+
+time:
+  - platform: sntp
+    id: time_now
+
+output:
+  - platform: gpio
+    id: board_info_ed
+    pin:
+      number: GPIO12
+      ignore_pin_validation_error: true
+
+select:
+  # On-chip region mode applied to the region(s) above by "LD2450 Set Region Filter".
+  #   Disabled  = chip reports all targets (region boxes ignored)
+  #   Detection = chip reports ONLY targets inside the region(s)
+  #   Filter    = chip EXCLUDES targets inside the region(s)
+  - platform: template
+    name: "LD2450 Zone Type"
+    id: chip_zone_type
+    icon: mdi:select-group
+    entity_category: config
+    optimistic: True
+    options:
+      - "Disabled"
+      - "Detection"
+      - "Filter"
+    initial_option: "Disabled"
+    restore_value: True
+
+switch:
+  # BLE scan master: ON starts continuous passive scanning. The switch is
+  # optimistic and has no independent controller-state feedback.
+  - platform: template
+    name: "BLE Scan"
+    id: ble_scan_sw
+    icon: mdi:bluetooth-settings
+    optimistic: true
+    restore_mode: ALWAYS_ON
+    turn_on_action:
+      - esp32_ble_tracker.start_scan:
+          continuous: true
+    turn_off_action:
+      - esp32_ble_tracker.stop_scan:
+  - platform: factory_reset
+    name: Factory Reset
+    disabled_by_default: True
+    icon: mdi:heart-broken
+    entity_category: diagnostic
+  - platform: template
+    name: Zout1 Enable
+    id: zone_ex1_enable
+    optimistic: True
+    icon: mdi:account-cancel
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    name: Zone Enable
+    id: zone_fn_enable
+    optimistic: True
+    icon: mdi:target-variant
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    name: Illuminance Fast-Update
+    id: bh1750_fast_update
+    optimistic: True
+    entity_category: diagnostic
+    restore_mode: RESTORE_DEFAULT_OFF
+    icon: mdi:run-fast
+  # Multi vs single target tracking on the chip. Factory default = multi (on).
+  # Optimistic display; "LD2450 Target Mode (chip)" text sensor shows the read-back truth.
+  - platform: template
+    name: "LD2450 Multi-Target"
+    id: chip_multi_target
+    icon: mdi:account-multiple
+    entity_category: config
+    optimistic: True
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - script.execute:
+          id: ld2450_cmd_multi
+          enable: true
+    turn_off_action:
+      - script.execute:
+          id: ld2450_cmd_multi
+          enable: false
+
+button:
+  - platform: restart
+    icon: mdi:power-cycle
+    name: "ESP Reboot"
+    entity_category: diagnostic
+  # ---- LD2450 chip command buttons ----
+  - platform: template
+    name: "LD2450 Bluetooth Disable"
+    icon: mdi:bluetooth-off
+    entity_category: config
+    on_press:
+      - script.execute:
+          id: ld2450_cmd_bt
+          enable: false
+  - platform: template
+    name: "LD2450 Bluetooth Enable"
+    icon: mdi:bluetooth
+    entity_category: config
+    disabled_by_default: True
+    on_press:
+      - script.execute:
+          id: ld2450_cmd_bt
+          enable: true
+  - platform: template
+    name: "LD2450 Set Region Filter"
+    icon: mdi:selection-drag
+    entity_category: config
+    on_press:
+      - script.execute: ld2450_cmd_set_region
+  - platform: template
+    name: "LD2450 Query Config"
+    icon: mdi:magnify
+    entity_category: config
+    on_press:
+      - script.execute: ld2450_cmd_query
+  - platform: template
+    name: "LD2450 Restart"
+    icon: mdi:restart
+    entity_category: config
+    on_press:
+      - script.execute: ld2450_cmd_restart
+  - platform: template
+    name: "LD2450 Factory Reset"
+    icon: mdi:alert-octagon
+    entity_category: config
+    disabled_by_default: True
+    on_press:
+      - script.execute: ld2450_cmd_factory
+
+uart:
+  id: uart_bus
+  tx_pin:
+    number: GPIO5
+    mode:
+      input: true
+      pullup: true
+  rx_pin:
+    number: GPIO4
+    mode:
+      input: true
+      pullup: true
+  baud_rate: 256000
+  parity: NONE
+  stop_bits: 1
+  data_bits: 8
+  debug:
+    direction: BOTH
+    dummy_receiver: True
+    after:
+     delimiter: [0X55, 0XCC]
+    sequence:
+      - lambda: |-
+          // restart-recovery stopwatch: max inter-frame gap inside the post-restart watch window.
+          // Runs BEFORE the publish throttle so EVERY real frame counts (throttle would hide gaps).
+          {
+            unsigned long _now = millis();
+            unsigned long _gap = _now - id(last_frame_seen_ms);
+            id(last_frame_seen_ms) = _now;
+            if (id(restart_watch_until_ms) != 0) {
+              if (_gap > id(restart_max_gap_ms)) id(restart_max_gap_ms) = _gap;
+              if (_now >= id(restart_watch_until_ms)) {
+                id(chip_restart_recovery).publish_state((float) id(restart_max_gap_ms));
+                id(restart_watch_until_ms) = 0;
+              }
+            }
+          }
+          // ===== LD2450 command-ACK realign + chip read-back =====
+          // Config-command ACK frames (FD FC FB FA ... 04 03 02 01) do NOT end in 55 CC. In config
+          // mode the chip STOPS streaming periodic frames, so ACKs arrive ALONE (fired by the uart
+          // debug 100ms timeout, no AA-FF-03-00 header following). Decode every ACK in [0.._ack_end)
+          // where _ack_end = the periodic header if one is present, else the whole buffer; then if a
+          // periodic frame IS present, strip the prefix so the original parse below stays byte-aligned.
+          size_t _hdr = bytes.size(); bool _found = false;
+          for (size_t _i = 0; _i + 4 <= bytes.size(); _i++) {
+            if (bytes[_i] == 0xAA && bytes[_i+1] == 0xFF && bytes[_i+2] == 0x03 && bytes[_i+3] == 0x00) { _found = true; _hdr = _i; break; }
+          }
+          size_t _ack_end = _hdr;                       // = bytes.size() when no periodic header found
+          size_t _p = 0;
+          while (_p + 10 <= _ack_end && bytes[_p] == 0xFD && bytes[_p+1] == 0xFC && bytes[_p+2] == 0xFB && bytes[_p+3] == 0xFA) {
+            uint16_t _len = bytes[_p+4] | (bytes[_p+5] << 8);
+            size_t _frame = 10 + _len;                 // header(4)+len(2)+value(_len)+footer(4)
+            if (_p + _frame > _ack_end) { break; }
+            uint8_t _cmd = bytes[_p+6];
+            uint8_t _st  = bytes[_p+7];
+            if (_st == 0x01) {
+              if (_cmd == 0xA0 && _frame >= 18) {       // firmware version (6 bytes at +12)
+                uint32_t _b = (uint32_t)bytes[_p+14] | ((uint32_t)bytes[_p+15]<<8) | ((uint32_t)bytes[_p+16]<<16) | ((uint32_t)bytes[_p+17]<<24);
+                char _v[24]; sprintf(_v, "%u.%02u.%08X", bytes[_p+13], bytes[_p+12], _b);  // patch shown in hex to match HLK (e.g. 2.04.23101915)
+                id(chip_ld2450_version).publish_state(_v);
+              } else if (_cmd == 0xA5 && _frame >= 16) { // MAC response; NO_MAC => BT off
+                bool _btoff = (bytes[_p+10]==0x08 && bytes[_p+11]==0x05 && bytes[_p+12]==0x04 && bytes[_p+13]==0x03 && bytes[_p+14]==0x02 && bytes[_p+15]==0x01);
+                id(chip_bt_active).publish_state(!_btoff);
+              } else if (_cmd == 0x91 && _frame >= 12) { // target mode at +10 (0x02 = multi)
+                id(chip_target_mode).publish_state(bytes[_p+10]==0x02 ? "Multi" : "Single");
+              } else if (_cmd == 0xC1 && _frame >= 12) { // zone type at +10
+                uint8_t _zt = bytes[_p+10];
+                id(chip_zone_type_state).publish_state(_zt==0x02 ? "Filter" : (_zt==0x01 ? "Detection" : "Disabled"));
+                // region coords follow at +12, 3 regions x {x1,y1,x2,y2} plain LE16 two's-complement
+                if (_frame >= 36) {
+                  int16_t _rg[12];
+                  for (int _k=0; _k<12; _k++) { _rg[_k] = (int16_t)(bytes[_p+12+_k*2] | (bytes[_p+12+_k*2+1] << 8)); }
+                  id(chip_region1_x1).publish_state(_rg[0]); id(chip_region1_y1).publish_state(_rg[1]);
+                  id(chip_region1_x2).publish_state(_rg[2]); id(chip_region1_y2).publish_state(_rg[3]);
+                  id(chip_region2_x1).publish_state(_rg[4]); id(chip_region2_y1).publish_state(_rg[5]);
+                  id(chip_region2_x2).publish_state(_rg[6]); id(chip_region2_y2).publish_state(_rg[7]);
+                  id(chip_region3_x1).publish_state(_rg[8]); id(chip_region3_y1).publish_state(_rg[9]);
+                  id(chip_region3_x2).publish_state(_rg[10]); id(chip_region3_y2).publish_state(_rg[11]);
+                }
+              }
+            }
+            _p += _frame;
+          }
+          if (!_found) { return; }                     // no periodic data in this buffer
+          if (_hdr > 0) { bytes.erase(bytes.begin(), bytes.begin() + _hdr); }
+          // ===== end realign; bytes[0..3] = AA FF 03 00 periodic header =====
+
+          // runtime publish throttle (was a hardcoded 50ms gate; now the LD2450 Publish Throttle number)
+          if ((millis() - id(last_update_ld2450)) <= (unsigned long) id(ld2450_throttle_ms).state) {
+            return;
+          };
+          id(last_update_ld2450) = millis();
+
+          // p1
+          int16_t p1_x = (uint16_t((bytes[5] << 8) | bytes[4] ));
+          if ((bytes[5] & 0x80) >> 7){
+            p1_x -= pow(2, 15);
+          }else{
+            p1_x = 0 - p1_x;
+          }
+
+          int16_t p1_y = (uint16_t((bytes[7] << 8) | bytes[6] ));
+          if ((bytes[7] & 0x80) >> 7){
+            p1_y -= pow(2, 15);
+          }else{
+            p1_y = 0 - p1_y;
+          }
+
+          int p1_speed = (bytes[9] << 8 | bytes[8] );
+          if ((bytes[9] & 0x80) >> 7){
+            p1_speed -= pow(2, 15);
+          }else{
+            p1_speed = 0 - p1_speed;
+          }
+          int16_t p1_distance_resolution = (uint16_t((bytes[11] << 8) | bytes[10] ));
+
+          // p2
+          int16_t p2_x = (uint16_t((bytes[13] << 8) | bytes[12] ));
+          if ((bytes[13] & 0x80) >> 7){
+            p2_x -=  pow(2, 15);
+          }else{
+            p2_x = 0 - p2_x;
+          }
+
+          int16_t p2_y = (uint16_t((bytes[15] << 8) | bytes[14] ));
+          if ((bytes[15] & 0x80) >> 7){
+            p2_y -= pow(2, 15);
+          }else{
+            p2_y = 0 - p2_y;
+          }
+
+          int p2_speed = (bytes[17] << 8 | bytes[16] );
+          if ((bytes[17] & 0x80) >> 7){
+            p2_speed -= pow(2, 15);
+          }else{
+            p2_speed = 0 - p2_speed;
+          }
+          int16_t p2_distance_resolution = (uint16_t((bytes[19] << 8) | bytes[18] ));
+
+          // p3
+          int16_t p3_x = (uint16_t((bytes[21] << 8) | bytes[20] ));
+          if ((bytes[21] & 0x80) >> 7){
+            p3_x -=  pow(2, 15);
+          }else{
+            p3_x = 0 - p3_x;
+          }
+
+          int16_t p3_y = (uint16_t((bytes[23] << 8) | bytes[22] ));
+          if ((bytes[23] & 0x80) >> 7){
+            p3_y -= pow(2, 15);
+          }else{
+            p3_y = 0 - p3_y;
+          }
+
+          int p3_speed = (bytes[25] << 8 | bytes[24] );
+          if ((bytes[25] & 0x80) >> 7){
+            p3_speed -= pow(2, 15);
+          }else{
+            p3_speed = 0 - p3_speed;
+          }
+
+          int16_t p3_distance_resolution = (uint16_t((bytes[27] << 8) | bytes[26] ));
+
+          bool p1_vaild = (p1_x != 0 || p1_y > 0);
+          bool p2_vaild = (p2_x != 0 || p2_y > 0);
+          bool p3_vaild = (p3_x != 0 || p3_y > 0);
+
+          // --- ATOMIC FRAME publish (2026-08-07): one coherent, device-timestamped
+          // payload per accepted frame = "t_ms|x1,y1,v1|x2,y2,v2|x3,y3,v3" (coords RAW
+          // mm, device-native - NOT HA's relabeled inches). t_ms = id(last_update_ld2450)
+          // (== millis() this frame). Kills per-entity x/y tearing + HA receive-jitter,
+          // and defeats HA integer-mm dedup (t_ms always changes => full rate reaches HA).
+          // Gated on the firmware's own validity flags so it stays quiet with no targets.
+          if (p1_vaild || p2_vaild || p3_vaild) {
+            char _frm[128];
+            snprintf(_frm, sizeof(_frm), "%lu|%d,%d,%d|%d,%d,%d|%d,%d,%d",
+                     (unsigned long) id(last_update_ld2450),
+                     p1_x, p1_y, p1_speed,
+                     p2_x, p2_y, p2_speed,
+                     p3_x, p3_y, p3_speed);
+            id(radar_frame).publish_state(_frm);
+          }
+
+          // zone exlude 1
+
+          int16_t target_count_in_zone_ex1 = 0;
+
+          int16_t zone_ex1_x_min = id(zone_ex1_x_begin).state;
+          int16_t zone_ex1_x_max = id(zone_ex1_x_end).state;
+          int16_t zone_ex1_y_min = id(zone_ex1_y_begin).state;
+          int16_t zone_ex1_y_max = id(zone_ex1_y_end).state;
+
+          bool p1_zone_ex_enter = false;
+          bool p2_zone_ex_enter = false;
+          bool p3_zone_ex_enter = false;
+
+          if (id(zone_ex1_enable).state){
+            if (p1_vaild){
+              if (p1_x >= zone_ex1_x_min && p1_x <= zone_ex1_x_max && p1_y >= zone_ex1_y_min && p1_y <= zone_ex1_y_max){
+                  p1_zone_ex_enter = true;
+                  target_count_in_zone_ex1 ++;
+              }
+            }
+            if (p2_vaild){
+              if (p2_x >= zone_ex1_x_min && p2_x <= zone_ex1_x_max && p2_y >= zone_ex1_y_min && p2_y <= zone_ex1_y_max){
+                  p2_zone_ex_enter = true;
+                  target_count_in_zone_ex1 ++;
+              }
+            }
+            if (p3_vaild){
+              if (p3_x >= zone_ex1_x_min && p3_x <= zone_ex1_x_max && p3_y >= zone_ex1_y_min && p3_y <= zone_ex1_y_max){
+                  p3_zone_ex_enter = true;
+                  target_count_in_zone_ex1 ++;
+              }
+            }
+          }
+
+          bool has_target_in_zone_ex1 = (target_count_in_zone_ex1 > 0);
+
+          int16_t all_target_counts = 0;
+          if (p1_vaild && !p1_zone_ex_enter){
+            all_target_counts ++;
+          }
+          if (p2_vaild && !p2_zone_ex_enter){
+            all_target_counts ++;
+          }
+          if (p3_vaild && !p3_zone_ex_enter){
+            all_target_counts ++;
+          }
+
+          bool has_target_in_zone_all = (all_target_counts > 0);
+
+          int16_t target_count_in_zone1 = 0;
+          bool has_target_in_zone1 = false;
+
+          int16_t target_count_in_zone2 = 0;
+          bool has_target_in_zone2 = false;
+
+          int16_t target_count_in_zone3 = 0;
+          bool has_target_in_zone3 = false;
+
+          if (id(zone_fn_enable).state){
+
+            // zone 1 check
+
+            int16_t zone1_x_min = id(zone1_x_begin).state;
+            int16_t zone1_x_max = id(zone1_x_end).state;
+            int16_t zone1_y_min = id(zone1_y_begin).state;
+            int16_t zone1_y_max = id(zone1_y_end).state;
+
+            if (p1_vaild && !p1_zone_ex_enter){
+              if (p1_x >= zone1_x_min && p1_x <= zone1_x_max && p1_y >= zone1_y_min && p1_y <= zone1_y_max){
+                  target_count_in_zone1 ++;
+              }
+            }
+            if (p2_vaild && !p2_zone_ex_enter){
+              if (p2_x >= zone1_x_min && p2_x <= zone1_x_max && p2_y >= zone1_y_min && p2_y <= zone1_y_max){
+                  target_count_in_zone1 ++;
+              }
+            }
+            if (p3_vaild && !p3_zone_ex_enter){
+              if (p3_x >= zone1_x_min && p3_x <= zone1_x_max && p3_y >= zone1_y_min && p3_y <= zone1_y_max){
+                  target_count_in_zone1 ++;
+              }
+            }
+            has_target_in_zone1 = (target_count_in_zone1 > 0);
+
+            // zone 2 check
+
+            int16_t zone2_x_min = id(zone2_x_begin).state;
+            int16_t zone2_x_max = id(zone2_x_end).state;
+            int16_t zone2_y_min = id(zone2_y_begin).state;
+            int16_t zone2_y_max = id(zone2_y_end).state;
+
+            if (p1_vaild && !p1_zone_ex_enter){
+              if (p1_x >= zone2_x_min && p1_x <= zone2_x_max && p1_y >= zone2_y_min && p1_y <= zone2_y_max){
+                  target_count_in_zone2 ++;
+              }
+            }
+            if (p2_vaild && !p2_zone_ex_enter){
+              if (p2_x >= zone2_x_min && p2_x <= zone2_x_max && p2_y >= zone2_y_min && p2_y <= zone2_y_max){
+                  target_count_in_zone2 ++;
+              }
+            }
+            if (p3_vaild && !p3_zone_ex_enter){
+              if (p3_x >= zone2_x_min && p3_x <= zone2_x_max && p3_y >= zone2_y_min && p3_y <= zone2_y_max){
+                  target_count_in_zone2 ++;
+              }
+            }
+
+            has_target_in_zone2 = (target_count_in_zone2 > 0);
+
+            // zone 3 check
+
+            int16_t zone3_x_min = id(zone3_x_begin).state;
+            int16_t zone3_x_max = id(zone3_x_end).state;
+            int16_t zone3_y_min = id(zone3_y_begin).state;
+            int16_t zone3_y_max = id(zone3_y_end).state;
+
+            if (p1_vaild && !p1_zone_ex_enter){
+              if (p1_x >= zone3_x_min && p1_x <= zone3_x_max && p1_y >= zone3_y_min && p1_y <= zone3_y_max){
+                  target_count_in_zone3 ++;
+              }
+            }
+            if (p2_vaild && !p2_zone_ex_enter){
+              if (p2_x >= zone3_x_min && p2_x <= zone3_x_max && p2_y >= zone3_y_min && p2_y <= zone3_y_max){
+                  target_count_in_zone3 ++;
+              }
+            }
+            if (p3_vaild && !p3_zone_ex_enter){
+              if (p3_x >= zone3_x_min && p3_x <= zone3_x_max && p3_y >= zone3_y_min && p3_y <= zone3_y_max){
+                  target_count_in_zone3 ++;
+              }
+            }
+            has_target_in_zone3 = (target_count_in_zone3 > 0);
+
+          }
+
+          // Angle, Position and Direction, idea from walberjunior.
+
+          float p1_angle = 0;
+          if (p1_vaild){
+            p1_angle = ((float)p1_x / (float)p1_y) * 180 / M_PI;;
+          }
+
+          std::basic_string<char> p1_position = "Static";
+          if (p1_speed > 0) {
+            p1_position = "Moving away";
+          } else if (p1_speed < 0) {
+            p1_position = "Approaching";
+          }
+
+          std::basic_string<char> p1_direction = "None";
+          if (p1_x > 0) {
+            p1_direction = "Right";
+          } else if (p1_x < 0) {
+            p1_direction = "Left";
+          } else if (p1_y > 0){
+            p1_direction = "Middle";
+          }
+
+          float p2_angle = 0;
+          if (p2_vaild){
+            p2_angle = ((float)p2_x / (float)p2_y) * 180 / M_PI;;
+          }
+
+          std::basic_string<char> p2_position = "Static";;
+          if (p2_speed > 0) {
+            p2_position = "Moving away";
+          } else if (p2_speed < 0) {
+            p2_position = "Approaching";
+          }
+
+          std::basic_string<char> p2_direction = "None";
+          if (p2_x > 0) {
+            p2_direction = "Right";
+          } else if (p2_x < 0) {
+            p2_direction = "Left";
+          } else if (p2_y > 0){
+            p2_direction = "Middle";
+          }
+
+          float p3_angle = 0;
+          if (p3_vaild){
+            p3_angle = ((float)p3_x / (float)p3_y) * 180 / M_PI;;
+          }
+
+          std::basic_string<char> p3_position = "Static";;
+          if (p3_speed > 0) {
+            p3_position = "Moving away";
+          } else if (p3_speed < 0) {
+            p3_position = "Approaching";
+          }
+
+          std::basic_string<char> p3_direction = "None";
+          if (p3_x > 0) {
+            p3_direction = "Right";
+          } else if (p3_x < 0) {
+            p3_direction = "Left";
+          } else if (p3_y > 0){
+            p3_direction = "Middle";
+          }
+
+          if (id(target1_angle).state != p1_angle){
+            id(target1_angle).publish_state(p1_angle);
+          }
+          if (id(target2_angle).state != p2_angle){
+            id(target2_angle).publish_state(p2_angle);
+          }
+          if (id(target3_angle).state != p3_angle){
+            id(target3_angle).publish_state(p3_angle);
+          }
+
+          if (p1_position != id(target1_position).state){
+            id(target1_position).publish_state(p1_position);
+          }
+          if (p2_position != id(target2_position).state){
+            id(target2_position).publish_state(p2_position);
+          }
+          if (p3_position != id(target3_position).state){
+            id(target3_position).publish_state(p3_position);
+          }
+
+          if (p1_direction != id(target1_direction).state){
+            id(target1_direction).publish_state(p1_direction);
+          }
+          if (p2_direction != id(target2_direction).state){
+            id(target2_direction).publish_state(p2_direction);
+          }
+          if (p3_direction != id(target3_direction).state){
+            id(target3_direction).publish_state(p3_direction);
+          }
+
+          // public all info
+
+          if (id(target1_x).state != p1_x){
+            id(target1_x).publish_state(p1_x);
+          }
+          if (id(target1_y).state != p1_y){
+            id(target1_y).publish_state(p1_y);
+          }
+
+          float p1_m_speed = float(p1_speed) / 100.0;
+          if (id(target1_speed).state != p1_m_speed){
+            id(target1_speed).publish_state(p1_m_speed);
+          }
+          if (id(target1_resolution).state != p1_distance_resolution){
+            id(target1_resolution).publish_state(p1_distance_resolution);
+          }
+
+          if (id(target2_x).state != p2_x){
+            id(target2_x).publish_state(p2_x);
+          }
+          if (id(target2_y).state != p2_y){
+            id(target2_y).publish_state(p2_y);
+          }
+          if (id(target2_speed).state != p2_speed){
+            id(target2_speed).publish_state(p2_speed);
+          }
+          if (id(target2_resolution).state != p2_distance_resolution){
+            id(target2_resolution).publish_state(p2_distance_resolution);
+          }
+
+          if (id(target3_x).state != p3_x){
+            id(target3_x).publish_state(p3_x);
+          }
+          if (id(target3_y).state != p3_y){
+            id(target3_y).publish_state(p3_y);
+          }
+          if (id(target3_speed).state != p3_speed){
+            id(target3_speed).publish_state(p3_speed);
+          }
+          if (id(target3_resolution).state != p3_distance_resolution){
+            id(target3_resolution).publish_state(p3_distance_resolution);
+          }
+
+          // publish target info
+
+          if (id(all_target_count).state != all_target_counts){
+            id(all_target_count).publish_state(all_target_counts);
+            id(any_target_exsits).publish_state(has_target_in_zone_all);
+          }else if (id(any_target_exsits).state != has_target_in_zone_all){
+            id(any_target_exsits).publish_state(has_target_in_zone_all);
+          }
+
+          if (id(zone1_target_count).state != target_count_in_zone1){
+            id(zone1_target_count).publish_state(target_count_in_zone1);
+            id(zone1_target_exsits).publish_state(has_target_in_zone1);
+          }else if (id(zone1_target_exsits).state != has_target_in_zone1){
+            id(zone1_target_exsits).publish_state(has_target_in_zone1);
+          }
+
+          if (id(zone2_target_count).state != target_count_in_zone2){
+            id(zone2_target_count).publish_state(target_count_in_zone2);
+            id(zone2_target_exsits).publish_state(has_target_in_zone2);
+          }else if (id(zone2_target_exsits).state != has_target_in_zone2){
+            id(zone2_target_exsits).publish_state(has_target_in_zone2);
+          }
+
+          if (id(zone3_target_count).state != target_count_in_zone3){
+            id(zone3_target_count).publish_state(target_count_in_zone3);
+            id(zone3_target_exsits).publish_state(has_target_in_zone3);
+          }else if (id(zone3_target_exsits).state != has_target_in_zone3){
+            id(zone3_target_exsits).publish_state(has_target_in_zone3);
+          }
+
+          // zout
+          if (id(zone_ex1_target_count).state != target_count_in_zone_ex1){
+            id(zone_ex1_target_count).publish_state(target_count_in_zone_ex1);
+          }
+
+          if (id(zone_ex1_target_exsits).state != has_target_in_zone_ex1){
+            id(zone_ex1_target_exsits).publish_state(has_target_in_zone_ex1);
+          }
+
+          if (!id(init_zone_publish)){
+            id(init_zone_publish) = true;
+          }
